@@ -1,2 +1,2 @@
-# scrapper
-web scrapper built with python and kafka
+# web-crawler
+web crawler built with python and kafka
