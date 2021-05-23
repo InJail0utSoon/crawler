@@ -1,0 +1,21 @@
+{
+	"mongo": {
+		"db_server_address": "localhost",
+		"db_port": 27017,
+		"db_name": "web_data"
+	},
+	
+	"es": {
+		"db_server_address": "localhost",
+		"index": "web_data",
+		"db_port": "9200",
+		"verify_certs": true
+	},
+	
+	"kafka": {
+		"concerned_topic": "web-crawler-queue",
+		"kafka_broker_url": "localhost:9092"
+	},
+	
+	"validators": ["mongo", "es", "kafka"]
+}
