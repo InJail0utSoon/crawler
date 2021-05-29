@@ -14,8 +14,11 @@
 	
 	"kafka": {
 		"concerned_topic": "web-crawler-queue",
-		"kafka_broker_url": "localhost:9092"
+		"kafka_broker_url": "localhost:9092",
+		"consumer_group": "spiders"
 	},
 	
-	"validators": ["mongo", "es", "kafka"]
+	"validators": ["mongo", "es", "kafka"],
+
+	"thread_count": 4
 }

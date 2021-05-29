@@ -6,6 +6,8 @@ import pymongo
 from kafka import KafkaConsumer, KafkaProducer
 from url_normalize import url_normalize
 import urllib
+import threading
+from queue import Queue
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 from datetime import datetime
@@ -62,7 +64,8 @@ def connect_to_es(app_config):
 def connect_to_kafka(app_config):
     crawler_topic = app_config['kafka']['concerned_topic']
     kafka_broker_url = app_config['kafka']['kafka_broker_url']
-    consumer = KafkaConsumer(crawler_topic, bootstrap_servers=kafka_broker_url, value_deserializer=json.loads)
+    consumer_group = app_config['kafka']['consumer_group']
+    consumer = KafkaConsumer(crawler_topic, bootstrap_servers=kafka_broker_url, value_deserializer=json.loads, group_id=consumer_group)
     producer = KafkaProducer(bootstrap_servers=kafka_broker_url)
     return KafkaConnection(consumer, producer)
 
@@ -74,12 +77,12 @@ class Webpage:
         self.content = content
         self.timestamp = timestamp
     
-    def persist(self, es_connection, mongo_connection):
-        logger.info("persisting url "+self.url)
+    def persist(self, es_connection, mongo_connection, thread_id):
+        logger.info(thread_id + " persisting url " + self.url)
         res = mongo_connection['web_data'].insert_one({"_id":self.url, "content":self.content, "timestamp":datetime.now()})
-        logger.info("mongo persist res -> "+str(res))
+        logger.info(thread_id + " mongo persist res -> " + str(res))
         res = es_connection.index(index='web_data', id=self.url, body={'url':self.url, 'content':self.content, 'timestamp':self.timestamp}) 
-        logger.info("es persist res -> "+res['result'])
+        logger.info(thread_id + " es persist res -> " + res['result'])
 
 
 class Task:
@@ -99,14 +102,15 @@ class Spider:
         self.kafka_producer = kafka_connection.producer
         self.request_headers = request_headers
         self.url_checker_middlewares = url_checker_middlewares
+        self.task_queue = Queue(maxsize = 1000000)
 
 
     def check_connections(self):
         return True
 
-    def push_new_tasks(self, urls):
+    def push_new_tasks(self, urls, thread_id):
         for url in urls:
-            logger.info("pushing new task -> "+url)
+            logger.info(thread_id + " pushing new task -> "+url)
             data = json.dumps({"url": url})
             self.kafka_producer.send("web-crawler-queue", bytes(data, encoding='utf-8')).get(timeout=10)
 
@@ -133,49 +137,61 @@ class Spider:
         return bool(parsed.netloc) and bool(parsed.scheme) and parsed.scheme in valid_schemes
 
 
-    def crawl(self, task):
-        head_res = requests.head(task.url, headers=request_headers)
+    def crawl(self, thread_id):
+        while True:
+            try:
+                task = self.task_queue.get();
+                head_res = requests.head(task.url, headers=request_headers)
+                
+                if head_res.status_code == 200:
+                    
+                    res = requests.get(task.url, headers=request_headers)
+                    html_content = res.content
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    texts = soup.findAll(text=True)
+                    visible_texts = filter(self.tag_visible, texts)
+                    content = u" ".join(text.strip() for text in visible_texts)
+                    webpage = Webpage(task.url, content, datetime.now())
+                    webpage.persist(self.es_client, self.mongo_client, thread_id)
+                    urls = set()
+
+                    for a_tag in soup.findAll("a"):
+                        href = a_tag.attrs.get("href")
+                        if href == "" or href is None:
+                            continue
+                        href = urllib.parse.urljoin(task.url, href)
+                        parsed_href = urllib.parse.urlparse(href)
+                        href = parsed_href.scheme + "://" +parsed_href.netloc + parsed_href.path
+                        if self.is_valid(href):
+                            urls.add(href)
+                    
+                    if task.url in urls: 
+                        urls.remove(task.url)
+
+                    filtered_urls = filter(self.check_need_to_crawl_url, urls)
+                    self.push_new_tasks(filtered_urls, thread_id)
+
+                else :
+                    logger.error(f'{task.url} responded with {head_res.status_code}')
+
+            except ex:
+                logger.error(ex)
+                print_exc()
         
-        if head_res.status_code == 200:
-            
-            res = requests.get(task.url, headers=request_headers)
-            html_content = res.content
-            soup = BeautifulSoup(html_content, 'html.parser')
-            texts = soup.findAll(text=True)
-            visible_texts = filter(self.tag_visible, texts)
-            content = u" ".join(text.strip() for text in visible_texts)
-            webpage = Webpage(task.url, content, datetime.now())
-            webpage.persist(self.es_client, self.mongo_client)
-            urls = set()
 
-            for a_tag in soup.findAll("a"):
-                href = a_tag.attrs.get("href")
-                if href == "" or href is None:
-                    continue
-                href = urllib.parse.urljoin(task.url, href)
-                parsed_href = urllib.parse.urlparse(href)
-                href = parsed_href.scheme + "://" +parsed_href.netloc + parsed_href.path
-                if self.is_valid(href):
-                    urls.add(href)
-            
-            if task.url in urls: 
-                urls.remove(task.url)
-
-            filtered_urls = filter(self.check_need_to_crawl_url, urls)
-            self.push_new_tasks(filtered_urls)
-
-        else :
-            logger.error(f'{task.url} responded with {head_res.status_code}')
-        
-
-    def run(self):
+    def run(self, thread_count):
         logger.info('running the spider')
+        logger.info('starting the threads') 
+        for i in range(0, thread_count):
+            thread = threading.Thread(target=self.crawl, args=(str(i)))
+            thread.start()
+
         for record in self.kafka_consumer:
             try:
                 task = Task(record.value['url'])
                 logger.info("new task ==> "+task.url)
                 self.check_connections()
-                self.crawl(task)
+                self.task_queue.put(task)
 
             except Exception as ex:
                 logger.error(ex)
@@ -190,7 +206,7 @@ def __main__(app_config):
         url_checking_middlewares = [MongoMiddleware(mongo_db_connection)]
 
         spider = Spider(mongo_db_connection, es_connection, kafka_connection, request_headers, url_checking_middlewares)
-        spider.run()
+        spider.run(app_config['thread_count'])
 
     except Exception as ex:
         print('spider faced some execption')
@@ -199,7 +215,7 @@ def __main__(app_config):
 
 def validate_config(app_config, validators):
     for validator in validators:
-        logger.info(str(validator) + " -> " + str(validator.is_valid(app_config)))
+        logger.info(str(validator.is_valid(app_config))+" :: "+str(validator))
         if not validator.is_valid(app_config):
             raise InvalidAppConfigException
 
